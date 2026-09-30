@@ -13,6 +13,41 @@
 // (username plus client-side-hashed password) that the real frontend uses.
 
 (function () {
+    function reportTiming(kind, data) {
+        try {
+            var body = JSON.stringify({ kind: kind, data: data });
+            if (navigator.sendBeacon) {
+                navigator.sendBeacon("index.php/telemetry", new Blob([body], { type: "application/json" }));
+            } else {
+                fetch("index.php/telemetry", { method: "POST", body: body, headers: { "Content-Type": "application/json" } }).catch(function () {});
+            }
+        } catch (e) {
+            // best-effort only -- never let telemetry break the login flow
+        }
+    }
+
+    function round(n) {
+        return typeof n === "number" && isFinite(n) ? Math.round(n) : null;
+    }
+
+    // Connection-quality signal: how long the boot page actually took to
+    // arrive and settle, broken down by phase, so slow-loading real assets
+    // (init.css in particular) show up as a measurable number instead of a
+    // vague "feels slow" impression.
+    function reportPageLoadTiming() {
+        var nav = performance.getEntriesByType && performance.getEntriesByType("navigation")[0];
+        if (!nav) return;
+        reportTiming("page_load", {
+            dns_ms: round(nav.domainLookupEnd - nav.domainLookupStart),
+            tcp_connect_ms: round(nav.connectEnd - nav.connectStart),
+            ttfb_ms: round(nav.responseStart - nav.requestStart),
+            html_download_ms: round(nav.responseEnd - nav.responseStart),
+            dom_content_loaded_ms: round(nav.domContentLoadedEventEnd - nav.startTime),
+            load_ms: round(nav.loadEventEnd - nav.startTime),
+            transfer_size_bytes: nav.transferSize || null,
+        });
+    }
+
     function sha1Hex(text) {
         var data = new TextEncoder().encode(text);
         return crypto.subtle.digest("SHA-1", data).then(function (buf) {
@@ -61,6 +96,7 @@
             var user = document.getElementById("login-user").value;
             var password = document.getElementById("login-password").value;
             var errorBox = document.getElementById("login-error");
+            var requestStart = performance.now();
 
             sha1Hex(password).then(function (hashed) {
                 var body = new URLSearchParams({ user: user, password: hashed, key: "" });
@@ -70,7 +106,11 @@
                     body: body.toString(),
                 });
             }).then(function (resp) {
-                return resp.json();
+                var rttMs = round(performance.now() - requestStart);
+                return resp.json().then(function (data) {
+                    reportTiming("login_rtt", { rtt_ms: rttMs, http_status: resp.status });
+                    return data;
+                });
             }).then(function (data) {
                 errorBox.textContent = data.msg || "Login failed";
                 errorBox.style.display = "block";
@@ -82,4 +122,14 @@
     }
 
     setTimeout(showForm, 350);
+
+    if (document.readyState === "complete") {
+        reportPageLoadTiming();
+    } else {
+        window.addEventListener("load", function () {
+            // Navigation timing entries (loadEventEnd in particular) aren't
+            // final until just after the load event fires.
+            setTimeout(reportPageLoadTiming, 0);
+        });
+    }
 })();

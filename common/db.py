@@ -54,3 +54,26 @@ async def log_event(
             )
     except Exception:
         logger.exception("failed to write event to postgres (source=%s type=%s)", source, event_type)
+
+
+async def log_js_event(
+    *,
+    src_ip: str,
+    kind: str,
+    src_port: int | None = None,
+    user_agent: str | None = None,
+    raw: str | None = None,
+    data: dict | None = None,
+) -> None:
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO js_events (src_ip, src_port, kind, user_agent, raw, data)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                """,
+                src_ip, src_port, kind, user_agent, raw, json.dumps(data or {}),
+            )
+    except Exception:
+        logger.exception("failed to write js_event to postgres (kind=%s)", kind)

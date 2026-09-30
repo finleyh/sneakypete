@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, "/app/common")
 
-from db import log_event  # noqa: E402
+from db import log_event, log_js_event  # noqa: E402
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -131,6 +131,35 @@ async def authentication_login(request: Request) -> Response:
     return with_banners(resp)
 
 
+async def telemetry(request: Request) -> Response:
+    # Not part of MagnusBilling's real API -- our own JS shim (bootstrap.js)
+    # reports page-load timing and login round-trip time here so we can see
+    # whether the payload weight (init.css in particular) is slowing down
+    # real connections. Logged to a separate js_events table, not `events`:
+    # this is connection-quality signal about the browser session, not an
+    # attacker action.
+    raw_body = (await request.body()).decode("utf-8", errors="replace")
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    kind = payload.get("kind") if isinstance(payload, dict) else None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not kind or not isinstance(data, dict):
+        return Response(status_code=204)
+
+    await log_js_event(
+        src_ip=client_ip(request),
+        src_port=request.client.port if request.client else None,
+        kind=str(kind)[:64],
+        user_agent=request.headers.get("user-agent"),
+        raw=raw_body,
+        data=data,
+    )
+    return Response(status_code=204)
+
+
 async def catch_all(request: Request) -> Response:
     await log_request(request, "probe")
     resp = Response(status_code=404, content="Not Found")
@@ -144,6 +173,7 @@ routes = [
     Route("/locale.js", locale_js, methods=["GET"]),
     Route("/bootstrap.js", bootstrap_js, methods=["GET"]),
     Route("/index.php/authentication/login", authentication_login, methods=["GET", "POST"]),
+    Route("/index.php/telemetry", telemetry, methods=["POST"]),
     Route("/{path:path}", catch_all, methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"]),
 ]
 
