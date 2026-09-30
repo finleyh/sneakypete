@@ -85,6 +85,18 @@ async def init_css(request: Request) -> Response:
     return with_banners(resp)
 
 
+async def locale_js(request: Request) -> Response:
+    await log_request(request, "probe")
+    resp = FileResponse(f"{STATIC_DIR}/locale.js", media_type="application/javascript")
+    return with_banners(resp)
+
+
+async def bootstrap_js(request: Request) -> Response:
+    await log_request(request, "probe")
+    resp = FileResponse(f"{STATIC_DIR}/bootstrap.js", media_type="application/javascript")
+    return with_banners(resp)
+
+
 async def authentication_login(request: Request) -> Response:
     # Mirrors the real AJAX call made by classic/src/view/main/LoginController.js:
     # Ext.Ajax.request({ url: 'index.php/authentication/login', params: { user, password: SHA1(password), key } })
@@ -129,6 +141,8 @@ routes = [
     Route("/", index, methods=["GET"]),
     Route("/index.php", index_php_bootstrap, methods=["GET"]),
     Route("/resources/init.css", init_css, methods=["GET"]),
+    Route("/locale.js", locale_js, methods=["GET"]),
+    Route("/bootstrap.js", bootstrap_js, methods=["GET"]),
     Route("/index.php/authentication/login", authentication_login, methods=["GET", "POST"]),
     Route("/{path:path}", catch_all, methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"]),
 ]
