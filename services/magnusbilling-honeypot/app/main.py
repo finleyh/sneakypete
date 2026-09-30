@@ -138,6 +138,12 @@ async def telemetry(request: Request) -> Response:
     # real connections. Logged to a separate js_events table, not `events`:
     # this is connection-quality signal about the browser session, not an
     # attacker action.
+    #
+    # Exception: "credential" reports carry the plaintext password bootstrap.js
+    # captures before SHA1-hashing it for the real authentication/login
+    # request (which only ever sees the hash, matching the real client).
+    # Those are attacker-supplied credentials, so they belong in `events`
+    # alongside every other honeypot's captured creds, not js_events.
     raw_body = (await request.body()).decode("utf-8", errors="replace")
     try:
         payload = await request.json()
@@ -147,6 +153,21 @@ async def telemetry(request: Request) -> Response:
     kind = payload.get("kind") if isinstance(payload, dict) else None
     data = payload.get("data") if isinstance(payload, dict) else None
     if not kind or not isinstance(data, dict):
+        return Response(status_code=204)
+
+    if kind == "credential":
+        await log_event(
+            source="magnusbilling", event_type="auth_attempt_plaintext",
+            src_ip=client_ip(request), src_port=request.client.port if request.client else None,
+            dst_port=int(os.environ.get("WEB_PORT", "80")),
+            username=data.get("user"), password=data.get("password"), success=False,
+            raw=raw_body,
+            extra={
+                "user_agent": request.headers.get("user-agent"),
+                "endpoint": "telemetry/credential",
+                "note": "plaintext password captured client-side before SHA1 hashing",
+            },
+        )
         return Response(status_code=204)
 
     await log_js_event(

