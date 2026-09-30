@@ -10,25 +10,43 @@ from db import log_event  # noqa: E402
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
-from starlette.templating import Jinja2Templates
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("honeypot.web")
 
-VERSION_BANNER = os.environ.get("MAGNUSBILLING_VERSION_BANNER", "MagnusBilling 7.3.0")
 PHP_BANNER = os.environ.get("PHP_VERSION_BANNER", "PHP/7.4.33")
 APACHE_BANNER = os.environ.get("APACHE_VERSION_BANNER", "Apache/2.4.41 (Ubuntu)")
 
-templates = Jinja2Templates(directory="/app/app/templates")
+STATIC_DIR = "/app/app/static"
+INDEX_HTML_PATH = f"{STATIC_DIR}/index.html"
 
-USERNAME_FIELDS = ("username", "user", "login")
-PASSWORD_FIELDS = ("password", "pass", "pwd")
+# Minimal stand-in for what the real `index.php`, loaded as <script src="index.php">
+# on the boot page, would emit: it just needs to define the globals the inline
+# bootstrap script in index.html reads (theme/captcha/branding config), so that
+# script doesn't throw before it gets to the (already-404ing) app bundle load.
+INDEX_PHP_BOOTSTRAP_JS = """
+window.reCaptchaKey = '';
+window.agentTitle = false;
+window.agentId = false;
+window.backgroundColor = '#0b1220';
+window.theme = 'blue-dark';
+window.wallpaper = 'wallpaper1';
+window.colorMenu = 'dark';
+window.lang = 'en';
+window.show_signup_button = true;
+"""
 
 
 def client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
+
+
+def with_banners(resp: Response) -> Response:
+    resp.headers["Server"] = APACHE_BANNER
+    resp.headers["X-Powered-By"] = PHP_BANNER
+    return resp
 
 
 async def log_request(request: Request, event_type: str, **extra_fields) -> None:
@@ -50,51 +68,61 @@ async def log_request(request: Request, event_type: str, **extra_fields) -> None
 
 
 async def index(request: Request) -> Response:
-    return RedirectResponse(url="/index.php")
+    await log_request(request, "probe")
+    resp = FileResponse(INDEX_HTML_PATH, media_type="text/html")
+    return with_banners(resp)
 
 
-async def login_page(request: Request) -> Response:
-    error = None
+async def index_php_bootstrap(request: Request) -> Response:
+    await log_request(request, "probe")
+    resp = Response(content=INDEX_PHP_BOOTSTRAP_JS, media_type="application/javascript")
+    return with_banners(resp)
 
+
+async def authentication_login(request: Request) -> Response:
+    # Mirrors the real AJAX call made by classic/src/view/main/LoginController.js:
+    # Ext.Ajax.request({ url: 'index.php/authentication/login', params: { user, password: SHA1(password), key } })
+    params = dict(request.query_params)
     if request.method == "POST":
-        form = await request.form()
-        username = next((form.get(f) for f in USERNAME_FIELDS if form.get(f)), None)
-        password = next((form.get(f) for f in PASSWORD_FIELDS if form.get(f)), None)
+        try:
+            form = await request.form()
+            params.update({k: v for k, v in form.items()})
+        except Exception:
+            pass
 
-        await log_event(
-            source="magnusbilling", event_type="auth_attempt",
-            src_ip=client_ip(request), src_port=request.client.port if request.client else None,
-            dst_port=int(os.environ.get("WEB_PORT", "80")),
-            username=str(username) if username is not None else None,
-            password=str(password) if password is not None else None,
-            success=False,
-            raw=f"POST {request.url.path}",
-            extra={"user_agent": request.headers.get("user-agent")},
-        )
-        error = "Invalid username or password"
-    else:
-        await log_request(request, "probe")
+    username = params.get("user")
+    password = params.get("password")  # the real client sends uppercase SHA1(password), not plaintext
+    captcha_key = params.get("key")
 
-    resp = templates.TemplateResponse(
-        request, "login.html",
-        {"error": error, "version": VERSION_BANNER},
+    await log_event(
+        source="magnusbilling", event_type="auth_attempt",
+        src_ip=client_ip(request), src_port=request.client.port if request.client else None,
+        dst_port=int(os.environ.get("WEB_PORT", "80")),
+        username=username, password=password, success=False,
+        raw=f"{request.method} {request.url.path}?{request.url.query}",
+        extra={
+            "user_agent": request.headers.get("user-agent"),
+            "endpoint": "authentication/login",
+            "captcha_key_present": bool(captcha_key),
+            "password_field_note": "real client sends uppercase SHA1(password), not plaintext",
+        },
     )
-    resp.headers["Server"] = APACHE_BANNER
-    resp.headers["X-Powered-By"] = PHP_BANNER
-    return resp
+
+    # Exact response shape/text of AuthenticationController::actionLogin()'s invalid-login branch.
+    resp = JSONResponse({"success": False, "msg": "Username and password combination is invalid"})
+    return with_banners(resp)
 
 
 async def catch_all(request: Request) -> Response:
     await log_request(request, "probe")
     resp = Response(status_code=404, content="Not Found")
-    resp.headers["Server"] = APACHE_BANNER
-    resp.headers["X-Powered-By"] = PHP_BANNER
-    return resp
+    return with_banners(resp)
 
 
 routes = [
     Route("/", index, methods=["GET"]),
-    Route("/index.php", login_page, methods=["GET", "POST"]),
+    Route("/index.php", index_php_bootstrap, methods=["GET"]),
+    Route("/index.php/authentication/login", authentication_login, methods=["GET", "POST"]),
     Route("/{path:path}", catch_all, methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"]),
 ]
 

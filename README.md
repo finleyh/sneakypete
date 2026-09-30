@@ -47,8 +47,16 @@ docker compose up -d --build
   carries some inherent reflection/amplification risk. Responses are kept
   small and rate-limited.
 - SIP auth attempts are logged as raw Digest fields (realm/nonce/response),
-  not plaintext — crack offline (e.g. hashcat mode 5500) if needed. AMI and
-  the web login already log plaintext credentials directly.
+  not plaintext — crack offline (e.g. hashcat mode 5500) if needed. AMI logs
+  plaintext credentials directly; the web login's `password` field is
+  whatever the client sent, which for a real MagnusBilling client is an
+  uppercase SHA1 hash, not plaintext (see below).
+- `magnusbilling-honeypot` serves an unmodified copy of MagnusBilling's real
+  boot page and replicates its actual `index.php/authentication/login`
+  request/response contract (client-side `SHA1(password)`, exact failure
+  JSON) instead of a generic fake login form — see
+  [services/magnusbilling-honeypot/NOTICE.md](services/magnusbilling-honeypot/NOTICE.md)
+  for where each piece came from.
 - Containers run as non-root with `cap_drop: ALL`, `no-new-privileges`, and
   read-only root filesystems, except Cowrie (needs to persist session/
   download data).
