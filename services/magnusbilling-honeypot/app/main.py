@@ -79,6 +79,12 @@ async def index_php_bootstrap(request: Request) -> Response:
     return with_banners(resp)
 
 
+async def init_css(request: Request) -> Response:
+    await log_request(request, "probe")
+    resp = FileResponse(f"{STATIC_DIR}/resources/init.css", media_type="text/css")
+    return with_banners(resp)
+
+
 async def authentication_login(request: Request) -> Response:
     # Mirrors the real AJAX call made by classic/src/view/main/LoginController.js:
     # Ext.Ajax.request({ url: 'index.php/authentication/login', params: { user, password: SHA1(password), key } })
@@ -122,6 +128,7 @@ async def catch_all(request: Request) -> Response:
 routes = [
     Route("/", index, methods=["GET"]),
     Route("/index.php", index_php_bootstrap, methods=["GET"]),
+    Route("/resources/init.css", init_css, methods=["GET"]),
     Route("/index.php/authentication/login", authentication_login, methods=["GET", "POST"]),
     Route("/{path:path}", catch_all, methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"]),
 ]
