@@ -1,0 +1,166 @@
+networks:
+  honeypot_net:
+    driver: bridge
+
+volumes:
+  pg_data:
+  cowrie_logs:
+  cowrie_var:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DATABASE}
+    # Bound ONLY to the Tailscale interface IP -- never exposed on the public
+    # interface. Trino (elsewhere on the tailnet) queries it via TAILSCALE_IP.
+    ports:
+      - "${TAILSCALE_IP}:5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - honeypot_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d ${PG_DATABASE}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    mem_limit: 512m
+    cpus: 1.0
+
+  sip-honeypot:
+    build:
+      context: .
+      dockerfile: services/sip-honeypot/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DATABASE: ${PG_DATABASE}
+      SIP_PORT: "5060"
+      ASTERISK_VERSION_BANNER: ${ASTERISK_VERSION_BANNER:-Asterisk PBX 18.9.0}
+      SIP_REALM: ${SIP_REALM:-asterisk}
+    ports:
+      - "5060:5060/udp"
+    networks:
+      - honeypot_net
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.5
+
+  ami-honeypot:
+    build:
+      context: .
+      dockerfile: services/ami-honeypot/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DATABASE: ${PG_DATABASE}
+      AMI_PORT: "5038"
+      AMI_VERSION_BANNER: ${AMI_VERSION_BANNER:-Asterisk Call Manager/8.4.0}
+    ports:
+      - "5038:5038"
+    networks:
+      - honeypot_net
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.5
+
+  magnusbilling-honeypot:
+    build:
+      context: .
+      dockerfile: services/magnusbilling-honeypot/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DATABASE: ${PG_DATABASE}
+      WEB_PORT: "80"
+      MAGNUSBILLING_VERSION_BANNER: ${MAGNUSBILLING_VERSION_BANNER:-MagnusBilling 7.3.0}
+      PHP_VERSION_BANNER: ${PHP_VERSION_BANNER:-PHP/7.4.33}
+      APACHE_VERSION_BANNER: ${APACHE_VERSION_BANNER:-Apache/2.4.41 (Ubuntu)}
+    ports:
+      - "80:80"
+    networks:
+      - honeypot_net
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.5
+
+  cowrie:
+    image: cowrie/cowrie:latest
+    restart: unless-stopped
+    ports:
+      - "22:2222"
+    volumes:
+      - ./services/ssh-honeypot/cowrie-etc/cowrie.cfg:/cowrie/cowrie-git/etc/cowrie.cfg:ro
+      - cowrie_logs:/cowrie/cowrie-git/var/log/cowrie
+      - cowrie_var:/cowrie/cowrie-git/var/lib/cowrie
+    networks:
+      - honeypot_net
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    cpus: 0.5
+
+  ssh-log-shipper:
+    build:
+      context: .
+      dockerfile: services/ssh-honeypot/log-shipper/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cowrie:
+        condition: service_started
+    environment:
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DATABASE: ${PG_DATABASE}
+      COWRIE_JSON_LOG: /cowrie-logs/cowrie.json
+      SSH_EXTERNAL_PORT: "22"
+    volumes:
+      - cowrie_logs:/cowrie-logs:ro
+    networks:
+      - honeypot_net
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.5

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MagnusBilling</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, Helvetica, sans-serif; background: #eef1f5; margin: 0; padding: 0; }
+        .login-wrap { max-width: 360px; margin: 80px auto; background: #fff; padding: 32px; border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.15); }
+        .login-wrap h1 { font-size: 20px; color: #333; margin-bottom: 4px; }
+        .login-wrap .subtitle { color: #888; font-size: 12px; margin-bottom: 20px; }
+        .login-wrap input[type=text], .login-wrap input[type=password] {
+            width: 100%; padding: 8px; margin-bottom: 12px; box-sizing: border-box;
+            border: 1px solid #ccc; border-radius: 3px;
+        }
+        .login-wrap button {
+            width: 100%; padding: 10px; background: #3c8dbc; color: #fff; border: none;
+            border-radius: 3px; cursor: pointer; font-size: 14px;
+        }
+        .login-wrap .error { background: #f8d7da; color: #842029; padding: 8px; border-radius: 3px; margin-bottom: 12px; font-size: 13px; }
+        .footer { text-align: center; color: #aaa; font-size: 11px; margin-top: 16px; }
+    </style>
+</head>
+<body>
+    <div class="login-wrap">
+        <h1>MagnusBilling</h1>
+        <div class="subtitle">Administrator Login</div>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        <form method="post" action="/index.php">
+            <input type="text" name="username" placeholder="Username" autocomplete="off">
+            <input type="password" name="password" placeholder="Password" autocomplete="off">
+            <button type="submit">Sign in</button>
+        </form>
+        <div class="footer">{{ version }}</div>
+    </div>
+</body>
+</html>
