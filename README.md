@@ -7,10 +7,10 @@ honeypot, all logging into one Postgres `events` table.
 
 | Service | Port |
 |---|---|
-| `sip-honeypot` | 5060/udp |
-| `ami-honeypot` | 5038/tcp |
-| `magnusbilling-honeypot` | 80/tcp |
-| `cowrie` (SSH) | 22/tcp |
+| `sip-honeypot` | 5060/udp, bound to `BIND_IP` (default all interfaces) |
+| `ami-honeypot` | 5038/tcp, bound to `BIND_IP` (default all interfaces) |
+| `magnusbilling-honeypot` | 80/tcp, bound to `BIND_IP` (default all interfaces) |
+| `cowrie` (SSH) | 22/tcp, bound to `BIND_IP` (default all interfaces) |
 | `ssh-log-shipper` | — (no listener, ships Cowrie's log into Postgres) |
 | `postgres` | 5432/tcp, bound only to `TAILSCALE_IP` |
 
@@ -31,6 +31,9 @@ Edit `.env`:
 - `PG_PASSWORD` — set a real secret.
 - `TAILSCALE_IP` — this host's tailnet IP (`tailscale ip -4`). Postgres binds
   only to this address.
+- `BIND_IP` — optional. IP the honeypot listeners (sip/ami/magnusbilling/
+  cowrie) bind to; defaults to `0.0.0.0` (all interfaces) if unset. Set this
+  to pin the decoys to one interface on a multi-homed host.
 
 ```bash
 docker compose up -d --build
@@ -38,8 +41,9 @@ docker compose up -d --build
 
 ## Operational notes
 
-- Every honeypot listener binds its real port on all interfaces by design.
-  Only Postgres is restricted to the tailnet — don't expose 5432 publicly.
+- Every honeypot listener binds its real port on all interfaces by default
+  (override with `BIND_IP` to pin to one interface). Only Postgres is
+  restricted to the tailnet — don't expose 5432 publicly.
 - Per-IP rate limiting ([common/ratelimit.py](common/ratelimit.py)) caps
   attempts/connections per source IP and temporarily bans noisy scanners.
   In-memory per-process only, not shared across restarts.

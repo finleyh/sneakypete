@@ -50,7 +50,7 @@ services:
       ASTERISK_VERSION_BANNER: ${ASTERISK_VERSION_BANNER:-Asterisk PBX 18.9.0}
       SIP_REALM: ${SIP_REALM:-asterisk}
     ports:
-      - "5060:5060/udp"
+      - "${BIND_IP:-0.0.0.0}:5060:5060/udp"
     networks:
       - honeypot_net
     read_only: true
@@ -78,7 +78,7 @@ services:
       AMI_PORT: "5038"
       AMI_VERSION_BANNER: ${AMI_VERSION_BANNER:-Asterisk Call Manager/8.4.0}
     ports:
-      - "5038:5038"
+      - "${BIND_IP:-0.0.0.0}:5038:5038"
     networks:
       - honeypot_net
     read_only: true
@@ -108,7 +108,7 @@ services:
       PHP_VERSION_BANNER: ${PHP_VERSION_BANNER:-PHP/7.4.33}
       APACHE_VERSION_BANNER: ${APACHE_VERSION_BANNER:-Apache/2.4.41 (Ubuntu)}
     ports:
-      - "80:80"
+      - "${BIND_IP:-0.0.0.0}:80:80"
     networks:
       - honeypot_net
     read_only: true
@@ -123,7 +123,7 @@ services:
     image: cowrie/cowrie:latest
     restart: unless-stopped
     ports:
-      - "22:2222"
+      - "${BIND_IP:-0.0.0.0}:22:2222"
     volumes:
       - ./services/ssh-honeypot/cowrie-etc/cowrie.cfg:/cowrie/cowrie-git/etc/cowrie.cfg:ro
       - cowrie_logs:/cowrie/cowrie-git/var/log/cowrie
