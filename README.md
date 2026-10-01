@@ -21,6 +21,12 @@ all services: `source`, `event_type`, `src_ip`, `username`, `password`,
 `success`, `session_id`, `raw`, plus a `extra` JSONB column for
 protocol-specific fields.
 
+**Querying from Trino**: Trino's PostgreSQL connector doesn't support the
+native `INET` type `src_ip` uses, and silently drops that column instead of
+erroring. Query [`events_trino`](db/init/003_trino_ip_views.sql) /
+`js_events_trino` from Trino instead of `events`/`js_events` directly — same
+columns, with `src_ip` cast to text.
+
 ## Setup
 
 ```bash
