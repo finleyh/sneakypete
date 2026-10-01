@@ -22,9 +22,3 @@ CREATE INDEX IF NOT EXISTS idx_events_src_ip   ON events (src_ip);
 CREATE INDEX IF NOT EXISTS idx_events_source   ON events (source);
 CREATE INDEX IF NOT EXISTS idx_events_session  ON events (session_id);
 CREATE INDEX IF NOT EXISTS idx_events_extra    ON events USING GIN (extra);
-
--- Dedicated, lower-cardinality view of credential attempts, handy for Trino reporting
-CREATE OR REPLACE VIEW credential_attempts AS
-    SELECT id, ts, source, src_ip, username, password, success
-    FROM events
-    WHERE event_type = 'auth_attempt';
