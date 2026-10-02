@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 
 sys.path.insert(0, "/app/common")
 
@@ -15,11 +16,45 @@ logger = logging.getLogger("honeypot.ami")
 
 AMI_PORT = int(os.environ.get("AMI_PORT", "5038"))
 BANNER = os.environ.get("AMI_VERSION_BANNER", "Asterisk Call Manager/8.4.0")
+ASTERISK_BANNER = os.environ.get("ASTERISK_VERSION_BANNER", "Asterisk PBX 18.9.0")
 READ_TIMEOUT = 30.0
 MAX_FAILED_LOGINS = 3
 MAX_ACTIONS_PER_CONN = 10
+MAX_AUTHENTICATED_ACTIONS = 40
 
 limiter = PerIpLimiter(max_attempts=30, window_seconds=60.0, ban_seconds=300.0, max_concurrent_per_ip=3)
+
+# Real-world AMI default credentials attackers actually try -- most notably
+# admin/amp111, FreePBX's long-infamous default manager.conf secret. Only
+# these succeed; everything else is still rejected like before. Override
+# with AMI_DEFAULT_CREDS="user1:pass1,user2:pass2" (comma-separated pairs).
+def _load_default_creds() -> set[tuple[str, str]]:
+    raw = os.environ.get("AMI_DEFAULT_CREDS")
+    if raw:
+        pairs = set()
+        for item in raw.split(","):
+            if ":" in item:
+                u, _, p = item.partition(":")
+                pairs.add((u.strip(), p.strip()))
+        return pairs
+    return {
+        ("admin", "amp111"),
+        ("admin", "admin"),
+        ("admin", "password"),
+        ("admin", "asterisk"),
+    }
+
+
+DEFAULT_CREDS = _load_default_creds()
+
+# A small fake PBX topology so Originate/SIPpeers etc. have something
+# plausible to reference -- real-looking enough to pull an attacker into
+# actually attempting toll fraud rather than disconnecting immediately.
+FAKE_PEERS = [
+    {"name": "100", "ip": "-none-", "status": "Unmonitored"},
+    {"name": "101", "ip": "-none-", "status": "Unmonitored"},
+    {"name": "6002", "ip": "-none-", "status": "Unmonitored"},
+]
 
 
 def parse_packet(block: str) -> dict[str, str]:
@@ -30,6 +65,89 @@ def parse_packet(block: str) -> dict[str, str]:
         key, _, value = line.partition(":")
         fields[key.strip().lower()] = value.strip()
     return fields
+
+
+def _actionid_suffix(fields: dict[str, str]) -> bytes:
+    actionid = fields.get("actionid")
+    return f"ActionID: {actionid}\r\n".encode() if actionid else b""
+
+
+def handle_originate(fields: dict[str, str]) -> bytes:
+    resp = b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Originate successfully queued\r\n\r\n"
+    return resp
+
+
+def handle_command(fields: dict[str, str]) -> bytes:
+    command = (fields.get("command") or "").strip().lower()
+    if command in ("core show version", "show version"):
+        output = ASTERISK_BANNER
+    elif command in ("sip show peers", "pjsip show endpoints"):
+        output = "\n".join(f"{p['name']}  {p['ip']}  {p['status']}" for p in FAKE_PEERS)
+    else:
+        output = ""
+    body = f"Response: Follows\r\n".encode() + _actionid_suffix(fields)
+    body += b"Privilege: Command\r\n"
+    if output:
+        body += output.encode() + b"\r\n"
+    body += b"--END COMMAND--\r\n\r\n"
+    return body
+
+
+def handle_sippeers(fields: dict[str, str]) -> bytes:
+    body = b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Peer status list will follow\r\n\r\n"
+    for peer in FAKE_PEERS:
+        body += (
+            b"Event: PeerEntry\r\n"
+            + _actionid_suffix(fields)
+            + b"Channeltype: SIP\r\n"
+            + f"ObjectName: {peer['name']}\r\n".encode()
+            + b"ChanObjectType: peer\r\n"
+            + f"IPaddress: {peer['ip']}\r\n".encode()
+            + b"IPport: 0\r\n"
+            + b"Dynamic: yes\r\n"
+            + f"Status: {peer['status']}\r\n".encode()
+            + b"\r\n"
+        )
+    body += (
+        b"Event: PeerlistComplete\r\n"
+        + _actionid_suffix(fields)
+        + b"EventList: Complete\r\n"
+        + f"ListItems: {len(FAKE_PEERS)}\r\n\r\n".encode()
+    )
+    return body
+
+
+def handle_ping(fields: dict[str, str]) -> bytes:
+    return (
+        b"Response: Success\r\n"
+        + _actionid_suffix(fields)
+        + b"Ping: Pong\r\n"
+        + f"Timestamp: {time.time():.6f}\r\n\r\n".encode()
+    )
+
+
+def handle_corestatus(fields: dict[str, str]) -> bytes:
+    return (
+        b"Response: Success\r\n"
+        + _actionid_suffix(fields)
+        + f"CoreStartupTime: {ASTERISK_BANNER}\r\n".encode()
+        + b"CoreReloadTime: 00:00:00\r\n"
+        + b"CoreCurrentCalls: 0\r\n\r\n"
+    )
+
+
+# Action name (lowercased) -> handler. Anything authenticated but not listed
+# here still gets a generic plausible success below, rather than an error --
+# the goal is to keep the session going so we see what they try next, not to
+# faithfully implement the whole AMI action set.
+AUTHENTICATED_HANDLERS = {
+    "originate": handle_originate,
+    "command": handle_command,
+    "sippeers": handle_sippeers,
+    "pjsipshowendpoints": handle_sippeers,
+    "ping": handle_ping,
+    "corestatus": handle_corestatus,
+}
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -45,13 +163,17 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
     failed_logins = 0
     actions_handled = 0
+    authenticated = False
     buf = ""
 
     try:
         writer.write(f"{BANNER}\r\n".encode())
         await writer.drain()
 
-        while actions_handled < MAX_ACTIONS_PER_CONN:
+        while True:
+            action_cap = MAX_AUTHENTICATED_ACTIONS if authenticated else MAX_ACTIONS_PER_CONN
+            if actions_handled >= action_cap:
+                break
             try:
                 chunk = await asyncio.wait_for(reader.read(4096), timeout=READ_TIMEOUT)
             except asyncio.TimeoutError:
@@ -66,21 +188,42 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 fields = parse_packet(block)
                 action = (fields.get("action") or "").lower()
 
-                if action == "login":
+                if action == "login" and not authenticated:
                     username = fields.get("username")
                     secret = fields.get("secret")
+                    success = (username, secret) in DEFAULT_CREDS
                     await log_event(
                         source="ami", event_type="auth_attempt", src_ip=ip, src_port=port, dst_port=AMI_PORT,
-                        username=username, password=secret, success=False, raw=block,
+                        username=username, password=secret, success=success, raw=block,
                         extra={"actionid": fields.get("actionid")},
                     )
-                    writer.write(b"Response: Error\r\nMessage: Authentication failed\r\n\r\n")
-                    await writer.drain()
-                    failed_logins += 1
-                    if failed_logins >= MAX_FAILED_LOGINS:
+                    if success:
+                        authenticated = True
+                        writer.write(b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Authentication accepted\r\n\r\n")
+                        await writer.drain()
+                    else:
+                        writer.write(b"Response: Error\r\n" + _actionid_suffix(fields) + b"Message: Authentication failed\r\n\r\n")
+                        await writer.drain()
+                        failed_logins += 1
+                        if failed_logins >= MAX_FAILED_LOGINS:
+                            writer.close()
+                            return
+                elif authenticated:
+                    await log_event(
+                        source="ami", event_type="session_action", src_ip=ip, src_port=port, dst_port=AMI_PORT,
+                        raw=block, extra={"action": fields.get("action"), "fields": fields},
+                    )
+                    if action == "logoff":
+                        writer.write(b"Response: Goodbye\r\n" + _actionid_suffix(fields) + b"Message: Thanks for all the fish.\r\n\r\n")
                         await writer.drain()
                         writer.close()
                         return
+                    handler = AUTHENTICATED_HANDLERS.get(action)
+                    if handler:
+                        writer.write(handler(fields))
+                    else:
+                        writer.write(b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Action completed\r\n\r\n")
+                    await writer.drain()
                 else:
                     await log_event(
                         source="ami", event_type="probe", src_ip=ip, src_port=port, dst_port=AMI_PORT,
@@ -89,7 +232,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     writer.write(b"Response: Error\r\nMessage: Authentication required\r\n\r\n")
                     await writer.drain()
 
-                if actions_handled >= MAX_ACTIONS_PER_CONN:
+                action_cap = MAX_AUTHENTICATED_ACTIONS if authenticated else MAX_ACTIONS_PER_CONN
+                if actions_handled >= action_cap:
                     break
     except (ConnectionResetError, BrokenPipeError):
         pass
