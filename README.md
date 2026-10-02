@@ -61,6 +61,16 @@ docker compose up -d --build
   plaintext credentials directly; the web login's `password` field is
   whatever the client sent, which for a real MagnusBilling client is an
   uppercase SHA1 hash, not plaintext (see below).
+- `ami-honeypot` isn't just a login wall: a small seeded list of real-world
+  AMI defaults (`AMI_DEFAULT_CREDS`, e.g. `admin`/`amp111` — FreePBX's
+  infamous default) succeeds, and the session continues with a small fake
+  PBX (`Originate`, `Command`, `SIPpeers`/`PJSIPShowEndpoints`,
+  `CoreShowChannels`, `Status`, `UpdateConfig`, `QueueStatus`/`QueueAdd`,
+  `DBGet`/`DBPut`) so you see what an attacker actually does with a working
+  session — including toll-fraud `Originate` attempts and backdoor peers
+  added via `UpdateConfig`. The deeper layer (fake in-progress calls,
+  queues, AstDB) is behind `AMI_RICH_EMULATION` (default `true`) — set it to
+  `false` to fall back to static empty responses without a code change.
 - `magnusbilling-honeypot` serves an unmodified copy of MagnusBilling's real
   boot page and replicates its actual `index.php/authentication/login`
   request/response contract (client-side `SHA1(password)`, exact failure

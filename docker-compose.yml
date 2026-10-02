@@ -77,6 +77,9 @@ services:
       PG_DATABASE: ${PG_DATABASE}
       AMI_PORT: "5038"
       AMI_VERSION_BANNER: ${AMI_VERSION_BANNER:-Asterisk Call Manager/8.4.0}
+      ASTERISK_VERSION_BANNER: ${ASTERISK_VERSION_BANNER:-Asterisk PBX 18.9.0}
+      AMI_DEFAULT_CREDS: ${AMI_DEFAULT_CREDS:-}
+      AMI_RICH_EMULATION: ${AMI_RICH_EMULATION:-true}
     ports:
       - "${BIND_IP:-0.0.0.0}:5038:5038"
     networks:

@@ -21,6 +21,14 @@ READ_TIMEOUT = 30.0
 MAX_FAILED_LOGINS = 3
 MAX_ACTIONS_PER_CONN = 10
 MAX_AUTHENTICATED_ACTIONS = 40
+CALL_DURATION_SECONDS = 20
+
+# Feature flag for the deeper emulation layer (fake in-progress calls after
+# Originate, QueueStatus/QueueAdd, DBGet/DBPut against a fake AstDB). Off
+# reverts exactly to the prior shipped behavior for those paths -- an escape
+# hatch to pull this back out without a code revert if it misbehaves.
+# AMI_RICH_EMULATION=false to disable.
+AMI_RICH_EMULATION = os.environ.get("AMI_RICH_EMULATION", "true").strip().lower() in ("1", "true", "yes")
 
 limiter = PerIpLimiter(max_attempts=30, window_seconds=60.0, ban_seconds=300.0, max_concurrent_per_ip=3)
 
@@ -50,15 +58,25 @@ DEFAULT_CREDS = _load_default_creds()
 # A small fake PBX topology so Originate/SIPpeers etc. have something
 # plausible to reference -- real-looking enough to pull an attacker into
 # actually attempting toll fraud rather than disconnecting immediately.
-# Each connection gets its own mutable copy (see session_peers in
-# handle_client) so a peer/extension added via UpdateConfig shows up in that
-# same session's later SIPpeers/Command output, without leaking across
-# sessions or needing real persistence.
 BASE_PEERS = [
     {"name": "100", "ip": "-none-", "status": "Unmonitored"},
     {"name": "101", "ip": "-none-", "status": "Unmonitored"},
     {"name": "6002", "ip": "-none-", "status": "Unmonitored"},
 ]
+
+
+def new_session() -> dict:
+    """Per-connection mutable fake-PBX state. Nothing here is persisted or
+    shared across connections/restarts -- it's just enough so that actions
+    taken earlier in *this* session (adding a peer, originating a call,
+    joining a queue, writing to the fake AstDB) are reflected consistently
+    by later actions in the same session, without needing real persistence."""
+    return {
+        "peers": list(BASE_PEERS),
+        "calls": [],   # rich emulation only
+        "queues": {},  # rich emulation only: queue name -> list of interfaces
+        "db": {},      # rich emulation only: (family, key) -> val
+    }
 
 
 def parse_packet(block: str) -> dict[str, str]:
@@ -76,17 +94,31 @@ def _actionid_suffix(fields: dict[str, str]) -> bytes:
     return f"ActionID: {actionid}\r\n".encode() if actionid else b""
 
 
-def handle_originate(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
-    resp = b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Originate successfully queued\r\n\r\n"
-    return resp
+def _active_calls(session: dict) -> list[dict]:
+    now = time.time()
+    session["calls"] = [c for c in session["calls"] if now - c["started_at"] < CALL_DURATION_SECONDS]
+    return session["calls"]
 
 
-def handle_command(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
+def handle_originate(fields: dict[str, str], session: dict) -> bytes:
+    if AMI_RICH_EMULATION:
+        channel = fields.get("channel") or f"Local/{len(session['calls'])}@fake"
+        session["calls"].append({
+            "channel": channel,
+            "context": fields.get("context", ""),
+            "exten": fields.get("exten", ""),
+            "callerid": fields.get("callerid", ""),
+            "started_at": time.time(),
+        })
+    return b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Originate successfully queued\r\n\r\n"
+
+
+def handle_command(fields: dict[str, str], session: dict) -> bytes:
     command = (fields.get("command") or "").strip().lower()
     if command in ("core show version", "show version"):
         output = ASTERISK_BANNER
     elif command in ("sip show peers", "pjsip show endpoints"):
-        output = "\n".join(f"{p['name']}  {p['ip']}  {p['status']}" for p in peers)
+        output = "\n".join(f"{p['name']}  {p['ip']}  {p['status']}" for p in session["peers"])
     else:
         output = ""
     body = f"Response: Follows\r\n".encode() + _actionid_suffix(fields)
@@ -97,7 +129,8 @@ def handle_command(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes
     return body
 
 
-def handle_sippeers(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
+def handle_sippeers(fields: dict[str, str], session: dict) -> bytes:
+    peers = session["peers"]
     body = b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Peer status list will follow\r\n\r\n"
     for peer in peers:
         body += (
@@ -121,39 +154,66 @@ def handle_sippeers(fields: dict[str, str], peers: list[dict[str, str]]) -> byte
     return body
 
 
-def handle_coreshowchannels(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
-    # No simulated calls are ever actually active, so this is always empty --
-    # which happens to be the realistic answer for a box nobody's routing
-    # real traffic through yet.
-    return (
-        b"Response: Success\r\n"
-        + _actionid_suffix(fields)
-        + b"Message: Channels will follow\r\n\r\n"
-        + b"Event: CoreShowChannelsComplete\r\n"
+def handle_coreshowchannels(fields: dict[str, str], session: dict) -> bytes:
+    calls = _active_calls(session) if AMI_RICH_EMULATION else []
+    body = b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Channels will follow\r\n\r\n"
+    now = time.time()
+    for call in calls:
+        duration = int(now - call["started_at"])
+        body += (
+            b"Event: CoreShowChannel\r\n"
+            + _actionid_suffix(fields)
+            + f"Channel: {call['channel']}\r\n".encode()
+            + f"CallerIDnum: {call['callerid']}\r\n".encode()
+            + b"ChannelState: 6\r\n"
+            + b"ChannelStateDesc: Up\r\n"
+            + f"Context: {call['context']}\r\n".encode()
+            + f"Extension: {call['exten']}\r\n".encode()
+            + b"Priority: 1\r\n"
+            + f"Duration: {duration // 60:02d}:{duration % 60:02d}\r\n\r\n".encode()
+        )
+    body += (
+        b"Event: CoreShowChannelsComplete\r\n"
         + _actionid_suffix(fields)
         + b"EventList: Complete\r\n"
-        + b"ListItems: 0\r\n\r\n"
+        + f"ListItems: {len(calls)}\r\n\r\n".encode()
     )
+    return body
 
 
-def handle_status(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
-    return (
-        b"Response: Success\r\n"
+def handle_status(fields: dict[str, str], session: dict) -> bytes:
+    calls = _active_calls(session) if AMI_RICH_EMULATION else []
+    body = b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Status will follow\r\n\r\n"
+    now = time.time()
+    for call in calls:
+        duration = int(now - call["started_at"])
+        body += (
+            b"Event: Status\r\n"
+            + _actionid_suffix(fields)
+            + f"Channel: {call['channel']}\r\n".encode()
+            + f"CallerIDNum: {call['callerid']}\r\n".encode()
+            + f"Context: {call['context']}\r\n".encode()
+            + f"Extension: {call['exten']}\r\n".encode()
+            + b"Priority: 1\r\n"
+            + f"Seconds: {duration}\r\n".encode()
+            + b"State: Up\r\n\r\n"
+        )
+    body += (
+        b"Event: StatusComplete\r\n"
         + _actionid_suffix(fields)
-        + b"Message: Status will follow\r\n\r\n"
-        + b"Event: StatusComplete\r\n"
-        + _actionid_suffix(fields)
-        + b"Items: 0\r\n\r\n"
+        + f"Items: {len(calls)}\r\n\r\n".encode()
     )
+    return body
 
 
-def handle_updateconfig(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
+def handle_updateconfig(fields: dict[str, str], session: dict) -> bytes:
     # Real AMI UpdateConfig takes numbered Action-NNNNNN/Cat-NNNNNN/
     # Var-NNNNNN/Value-NNNNNN tuples to add/modify config file sections --
     # this is the actual mechanism attackers use to plant a backdoor
     # peer/extension. We don't write any real config, but we do add the
     # category name to this session's fake peer list, so a follow-up
     # SIPpeers/Command genuinely reflects whatever they just "added".
+    peers = session["peers"]
     existing = {p["name"] for p in peers}
     for key, value in fields.items():
         if key.startswith("cat-") and value and value not in existing:
@@ -166,7 +226,7 @@ def handle_updateconfig(fields: dict[str, str], peers: list[dict[str, str]]) -> 
     )
 
 
-def handle_ping(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
+def handle_ping(fields: dict[str, str], session: dict) -> bytes:
     return (
         b"Response: Success\r\n"
         + _actionid_suffix(fields)
@@ -175,7 +235,7 @@ def handle_ping(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
     )
 
 
-def handle_corestatus(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
+def handle_corestatus(fields: dict[str, str], session: dict) -> bytes:
     return (
         b"Response: Success\r\n"
         + _actionid_suffix(fields)
@@ -185,12 +245,77 @@ def handle_corestatus(fields: dict[str, str], peers: list[dict[str, str]]) -> by
     )
 
 
+def handle_queuestatus(fields: dict[str, str], session: dict) -> bytes:
+    body = b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Queue status will follow\r\n\r\n"
+    for queue, members in session["queues"].items():
+        body += (
+            b"Event: QueueParams\r\n"
+            + _actionid_suffix(fields)
+            + f"Queue: {queue}\r\n".encode()
+            + b"Calls: 0\r\n"
+            + b"Completed: 0\r\n"
+            + b"Abandoned: 0\r\n\r\n"
+        )
+        for member in members:
+            body += (
+                b"Event: QueueMember\r\n"
+                + _actionid_suffix(fields)
+                + f"Queue: {queue}\r\n".encode()
+                + f"Interface: {member}\r\n".encode()
+                + b"Status: 1\r\n"
+                + b"Paused: 0\r\n\r\n"
+            )
+    body += b"Event: QueueStatusComplete\r\n" + _actionid_suffix(fields) + b"\r\n"
+    return body
+
+
+def handle_queueadd(fields: dict[str, str], session: dict) -> bytes:
+    queue = fields.get("queue")
+    interface = fields.get("interface")
+    if not queue or not interface:
+        return b"Response: Error\r\n" + _actionid_suffix(fields) + b"Message: Missing queue parameter\r\n\r\n"
+    members = session["queues"].setdefault(queue, [])
+    if interface not in members:
+        members.append(interface)
+    return (
+        b"Response: Success\r\n"
+        + _actionid_suffix(fields)
+        + f"Message: Added interface '{interface}' to queue '{queue}'\r\n\r\n".encode()
+    )
+
+
+def handle_dbget(fields: dict[str, str], session: dict) -> bytes:
+    family = fields.get("family", "")
+    key = fields.get("key", "")
+    val = session["db"].get((family, key))
+    if val is None:
+        return b"Response: Error\r\n" + _actionid_suffix(fields) + b"Message: Database entry not found\r\n\r\n"
+    return (
+        b"Response: Success\r\n"
+        + _actionid_suffix(fields)
+        + b"Message: Result will follow\r\n\r\n"
+        + b"Event: DBGetResponse\r\n"
+        + _actionid_suffix(fields)
+        + f"Family: {family}\r\n".encode()
+        + f"Key: {key}\r\n".encode()
+        + f"Val: {val}\r\n\r\n".encode()
+    )
+
+
+def handle_dbput(fields: dict[str, str], session: dict) -> bytes:
+    family = fields.get("family", "")
+    key = fields.get("key", "")
+    val = fields.get("val", "")
+    session["db"][(family, key)] = val
+    return b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Updated database successfully\r\n\r\n"
+
+
 # Action name (lowercased) -> handler. Anything authenticated but not listed
 # here still gets a generic plausible success below, rather than an error --
 # the goal is to keep the session going so we see what they try next, not to
 # faithfully implement the whole AMI action set. Every handler takes
-# (fields, session_peers) even if it ignores one of them, so dispatch below
-# stays uniform.
+# (fields, session) even if it ignores part of it, so dispatch below stays
+# uniform.
 AUTHENTICATED_HANDLERS = {
     "originate": handle_originate,
     "command": handle_command,
@@ -202,6 +327,13 @@ AUTHENTICATED_HANDLERS = {
     "status": handle_status,
     "updateconfig": handle_updateconfig,
 }
+if AMI_RICH_EMULATION:
+    AUTHENTICATED_HANDLERS.update({
+        "queuestatus": handle_queuestatus,
+        "queueadd": handle_queueadd,
+        "dbget": handle_dbget,
+        "dbput": handle_dbput,
+    })
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -218,7 +350,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     failed_logins = 0
     actions_handled = 0
     authenticated = False
-    session_peers = list(BASE_PEERS)
+    session = new_session()
     buf = ""
 
     try:
@@ -275,7 +407,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         return
                     handler = AUTHENTICATED_HANDLERS.get(action)
                     if handler:
-                        writer.write(handler(fields, session_peers))
+                        writer.write(handler(fields, session))
                     else:
                         writer.write(b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Action completed\r\n\r\n")
                     await writer.drain()
@@ -304,7 +436,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 async def main() -> None:
     server = await asyncio.start_server(handle_client, "0.0.0.0", AMI_PORT)
-    logger.info("AMI honeypot listening on TCP 0.0.0.0:%s (banner=%r)", AMI_PORT, BANNER)
+    logger.info(
+        "AMI honeypot listening on TCP 0.0.0.0:%s (banner=%r, rich_emulation=%s)",
+        AMI_PORT, BANNER, AMI_RICH_EMULATION,
+    )
     async with server:
         await server.serve_forever()
 
