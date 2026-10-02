@@ -50,7 +50,11 @@ DEFAULT_CREDS = _load_default_creds()
 # A small fake PBX topology so Originate/SIPpeers etc. have something
 # plausible to reference -- real-looking enough to pull an attacker into
 # actually attempting toll fraud rather than disconnecting immediately.
-FAKE_PEERS = [
+# Each connection gets its own mutable copy (see session_peers in
+# handle_client) so a peer/extension added via UpdateConfig shows up in that
+# same session's later SIPpeers/Command output, without leaking across
+# sessions or needing real persistence.
+BASE_PEERS = [
     {"name": "100", "ip": "-none-", "status": "Unmonitored"},
     {"name": "101", "ip": "-none-", "status": "Unmonitored"},
     {"name": "6002", "ip": "-none-", "status": "Unmonitored"},
@@ -72,17 +76,17 @@ def _actionid_suffix(fields: dict[str, str]) -> bytes:
     return f"ActionID: {actionid}\r\n".encode() if actionid else b""
 
 
-def handle_originate(fields: dict[str, str]) -> bytes:
+def handle_originate(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
     resp = b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Originate successfully queued\r\n\r\n"
     return resp
 
 
-def handle_command(fields: dict[str, str]) -> bytes:
+def handle_command(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
     command = (fields.get("command") or "").strip().lower()
     if command in ("core show version", "show version"):
         output = ASTERISK_BANNER
     elif command in ("sip show peers", "pjsip show endpoints"):
-        output = "\n".join(f"{p['name']}  {p['ip']}  {p['status']}" for p in FAKE_PEERS)
+        output = "\n".join(f"{p['name']}  {p['ip']}  {p['status']}" for p in peers)
     else:
         output = ""
     body = f"Response: Follows\r\n".encode() + _actionid_suffix(fields)
@@ -93,9 +97,9 @@ def handle_command(fields: dict[str, str]) -> bytes:
     return body
 
 
-def handle_sippeers(fields: dict[str, str]) -> bytes:
+def handle_sippeers(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
     body = b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Peer status list will follow\r\n\r\n"
-    for peer in FAKE_PEERS:
+    for peer in peers:
         body += (
             b"Event: PeerEntry\r\n"
             + _actionid_suffix(fields)
@@ -112,12 +116,57 @@ def handle_sippeers(fields: dict[str, str]) -> bytes:
         b"Event: PeerlistComplete\r\n"
         + _actionid_suffix(fields)
         + b"EventList: Complete\r\n"
-        + f"ListItems: {len(FAKE_PEERS)}\r\n\r\n".encode()
+        + f"ListItems: {len(peers)}\r\n\r\n".encode()
     )
     return body
 
 
-def handle_ping(fields: dict[str, str]) -> bytes:
+def handle_coreshowchannels(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
+    # No simulated calls are ever actually active, so this is always empty --
+    # which happens to be the realistic answer for a box nobody's routing
+    # real traffic through yet.
+    return (
+        b"Response: Success\r\n"
+        + _actionid_suffix(fields)
+        + b"Message: Channels will follow\r\n\r\n"
+        + b"Event: CoreShowChannelsComplete\r\n"
+        + _actionid_suffix(fields)
+        + b"EventList: Complete\r\n"
+        + b"ListItems: 0\r\n\r\n"
+    )
+
+
+def handle_status(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
+    return (
+        b"Response: Success\r\n"
+        + _actionid_suffix(fields)
+        + b"Message: Status will follow\r\n\r\n"
+        + b"Event: StatusComplete\r\n"
+        + _actionid_suffix(fields)
+        + b"Items: 0\r\n\r\n"
+    )
+
+
+def handle_updateconfig(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
+    # Real AMI UpdateConfig takes numbered Action-NNNNNN/Cat-NNNNNN/
+    # Var-NNNNNN/Value-NNNNNN tuples to add/modify config file sections --
+    # this is the actual mechanism attackers use to plant a backdoor
+    # peer/extension. We don't write any real config, but we do add the
+    # category name to this session's fake peer list, so a follow-up
+    # SIPpeers/Command genuinely reflects whatever they just "added".
+    existing = {p["name"] for p in peers}
+    for key, value in fields.items():
+        if key.startswith("cat-") and value and value not in existing:
+            peers.append({"name": value, "ip": "-none-", "status": "Unmonitored"})
+            existing.add(value)
+    return (
+        b"Response: Success\r\n"
+        + _actionid_suffix(fields)
+        + b"Message: The requested update was successful\r\n\r\n"
+    )
+
+
+def handle_ping(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
     return (
         b"Response: Success\r\n"
         + _actionid_suffix(fields)
@@ -126,7 +175,7 @@ def handle_ping(fields: dict[str, str]) -> bytes:
     )
 
 
-def handle_corestatus(fields: dict[str, str]) -> bytes:
+def handle_corestatus(fields: dict[str, str], peers: list[dict[str, str]]) -> bytes:
     return (
         b"Response: Success\r\n"
         + _actionid_suffix(fields)
@@ -139,7 +188,9 @@ def handle_corestatus(fields: dict[str, str]) -> bytes:
 # Action name (lowercased) -> handler. Anything authenticated but not listed
 # here still gets a generic plausible success below, rather than an error --
 # the goal is to keep the session going so we see what they try next, not to
-# faithfully implement the whole AMI action set.
+# faithfully implement the whole AMI action set. Every handler takes
+# (fields, session_peers) even if it ignores one of them, so dispatch below
+# stays uniform.
 AUTHENTICATED_HANDLERS = {
     "originate": handle_originate,
     "command": handle_command,
@@ -147,6 +198,9 @@ AUTHENTICATED_HANDLERS = {
     "pjsipshowendpoints": handle_sippeers,
     "ping": handle_ping,
     "corestatus": handle_corestatus,
+    "coreshowchannels": handle_coreshowchannels,
+    "status": handle_status,
+    "updateconfig": handle_updateconfig,
 }
 
 
@@ -164,6 +218,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     failed_logins = 0
     actions_handled = 0
     authenticated = False
+    session_peers = list(BASE_PEERS)
     buf = ""
 
     try:
@@ -220,7 +275,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         return
                     handler = AUTHENTICATED_HANDLERS.get(action)
                     if handler:
-                        writer.write(handler(fields))
+                        writer.write(handler(fields, session_peers))
                     else:
                         writer.write(b"Response: Success\r\n" + _actionid_suffix(fields) + b"Message: Action completed\r\n\r\n")
                     await writer.drain()
