@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 
 sys.path.insert(0, "/app/common")
@@ -41,6 +42,32 @@ window.show_signup_button = true;
 
 def client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
+
+
+_CANDIDATE_RE = re.compile(r"candidate:\S+ \d+ \S+ \d+ (\S+) \d+ typ (\S+)")
+
+
+def _parse_webrtc_candidates(candidates: list) -> list[dict]:
+    parsed = []
+    for c in candidates if isinstance(candidates, list) else []:
+        m = _CANDIDATE_RE.search(str(c))
+        if m:
+            parsed.append({"ip": m.group(1), "type": m.group(2)})
+    return parsed
+
+
+def _is_private_ipv4(ip: str) -> bool:
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return True  # not a bare IPv4 literal (IPv6, .local mDNS, etc.) -- not a usable public-IP signal
+    try:
+        octets = [int(p) for p in parts]
+    except ValueError:
+        return True
+    if any(o < 0 or o > 255 for o in octets):
+        return True
+    a, b = octets[0], octets[1]
+    return a == 10 or a == 127 or (a == 169 and b == 254) or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31)
 
 
 def with_banners(resp: Response) -> Response:
@@ -144,6 +171,10 @@ async def telemetry(request: Request) -> Response:
     # request (which only ever sees the hash, matching the real client).
     # Those are attacker-supplied credentials, so they belong in `events`
     # alongside every other honeypot's captured creds, not js_events.
+    #
+    # "webrtc_leak" reports stay in js_events but get the candidate list
+    # parsed and compared against this connection's src_ip server-side
+    # before storage -- see the branch below.
     raw_body = (await request.body()).decode("utf-8", errors="replace")
     try:
         payload = await request.json()
@@ -169,6 +200,23 @@ async def telemetry(request: Request) -> Response:
             },
         )
         return Response(status_code=204)
+
+    if kind == "webrtc_leak":
+        # bootstrap.js's RTCPeerConnection gathers ICE candidates against our
+        # own stun-server (see docker-compose.yml) -- that happens outside
+        # any VPN/proxy tunnel, so a public IP here that differs from the
+        # HTTP connection's src_ip means we just saw through their VPN.
+        http_src_ip = client_ip(request)
+        parsed = _parse_webrtc_candidates(data.get("candidates"))
+        public_ips = sorted({c["ip"] for c in parsed if not _is_private_ipv4(c["ip"])})
+        leaked_ips = [ip for ip in public_ips if ip != http_src_ip]
+        data = {
+            "candidates": parsed,
+            "http_src_ip": http_src_ip,
+            "public_ips": public_ips,
+            "leaked_public_ips": leaked_ips,
+            "vpn_suspected": bool(leaked_ips),
+        }
 
     await log_js_event(
         src_ip=client_ip(request),

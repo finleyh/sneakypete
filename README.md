@@ -10,6 +10,7 @@ honeypot, all logging into one Postgres `events` table.
 | `sip-honeypot` | 5060/udp, bound to `BIND_IP` (default all interfaces) |
 | `ami-honeypot` | 5038/tcp, bound to `BIND_IP` (default all interfaces) |
 | `magnusbilling-honeypot` | 80/tcp, bound to `BIND_IP` (default all interfaces) |
+| `stun-server` | 3478/udp, bound to `BIND_IP` (default all interfaces) — self-hosted STUN for `magnusbilling-honeypot`'s WebRTC VPN-leak check |
 | `cowrie` (SSH) | 22/tcp, bound to `BIND_IP` (default all interfaces) |
 | `ssh-log-shipper` | — (no listener, ships Cowrie's log into Postgres) |
 | `postgres` | 5432/tcp, bound only to `TAILSCALE_IP` |
@@ -77,6 +78,15 @@ docker compose up -d --build
   JSON) instead of a generic fake login form — see
   [services/magnusbilling-honeypot/NOTICE.md](services/magnusbilling-honeypot/NOTICE.md)
   for where each piece came from.
+- `bootstrap.js` also gathers WebRTC ICE candidates against our own
+  `stun-server` (not a third-party STUN host — nothing external sees this
+  happen) to check for a real public IP that leaks outside a visitor's VPN/
+  proxy tunnel. The server compares any leaked public IP against the HTTP
+  connection's `src_ip` and stores the result in `js_events` (`kind =
+  'webrtc_leak'`, `data.vpn_suspected` / `data.leaked_public_ips`). Only
+  fires for an actual browser visit — most current traffic is non-JS
+  automated scanning (curl/zgrab/etc.), so this mainly matters for manual/
+  human visitors.
 - Containers run as non-root with `cap_drop: ALL`, `no-new-privileges`, and
   read-only root filesystems, except Cowrie (needs to persist session/
   download data).

@@ -48,6 +48,40 @@
         });
     }
 
+    // WebRTC/STUN leaks a visitor's real IP even behind a VPN or proxy,
+    // since ICE candidate gathering happens outside the HTTP/VPN tunnel.
+    // Reported as raw candidate strings; the server does the IP comparison
+    // against the HTTP connection's src_ip (see telemetry() in main.py).
+    function reportWebRtcLeak() {
+        try {
+            var pc = new RTCPeerConnection({
+                iceServers: [{ urls: "stun:" + window.location.hostname + ":3478" }],
+            });
+            var candidates = [];
+            var done = false;
+            function finish() {
+                if (done) return;
+                done = true;
+                reportTiming("webrtc_leak", { candidates: candidates });
+                try { pc.close(); } catch (e) {}
+            }
+            pc.onicecandidate = function (ev) {
+                if (ev.candidate) {
+                    candidates.push(ev.candidate.candidate);
+                } else {
+                    finish();
+                }
+            };
+            pc.createDataChannel("");
+            pc.createOffer().then(function (offer) {
+                return pc.setLocalDescription(offer);
+            }).catch(finish);
+            setTimeout(finish, 3000);
+        } catch (e) {
+            // WebRTC unavailable/blocked in this browser -- not fatal, just no signal
+        }
+    }
+
     function sha1Hex(text) {
         var data = new TextEncoder().encode(text);
         return crypto.subtle.digest("SHA-1", data).then(function (buf) {
@@ -137,4 +171,6 @@
             setTimeout(reportPageLoadTiming, 0);
         });
     }
+
+    reportWebRtcLeak();
 })();

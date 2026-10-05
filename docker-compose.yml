@@ -122,6 +122,32 @@ services:
     mem_limit: 128m
     cpus: 0.5
 
+  # Self-hosted STUN server for magnusbilling-honeypot's bootstrap.js: lets a
+  # visitor's browser gather WebRTC ICE candidates against OUR server instead
+  # of a third-party STUN host (nothing external sees that this happened,
+  # unlike using e.g. Google's public STUN). STUN binding requests need no
+  # auth, so this runs with TURN relay/auth disabled entirely -- it only ever
+  # answers "what IP/port did this request come from", nothing else.
+  stun-server:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    command: ["--no-auth", "--no-tls", "--min-port=49160", "--max-port=49180", "--log-file=stdout"]
+    ports:
+      - "${BIND_IP:-0.0.0.0}:3478:3478/udp"
+    networks:
+      - honeypot_net
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
+      - /var/lib/coturn
+      - /var/run
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+    cpus: 0.25
+
   cowrie:
     image: cowrie/cowrie:latest
     restart: unless-stopped
