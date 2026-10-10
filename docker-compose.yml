@@ -6,6 +6,7 @@ volumes:
   pg_data:
   cowrie_logs:
   cowrie_var:
+  tls_cert:
 
 services:
   postgres:
@@ -112,6 +113,47 @@ services:
       APACHE_VERSION_BANNER: ${APACHE_VERSION_BANNER:-Apache/2.4.41 (Ubuntu)}
     ports:
       - "${BIND_IP:-0.0.0.0}:80:80"
+    networks:
+      - honeypot_net
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.5
+
+  # HTTPS for the web decoy. Terminates TLS on 443 with a self-signed
+  # snakeoil-style cert (no domain needed -- how most real VoIP boxes run),
+  # fingerprints each raw ClientHello (JA4) before the handshake, then proxies
+  # to magnusbilling-honeypot over the docker network with the real client
+  # IP/port + JA4 in an X-Honeypot-Conn header. Port 80 is untouched.
+  magnusbilling-tls:
+    build:
+      context: .
+      dockerfile: services/magnusbilling-tls/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      magnusbilling-honeypot:
+        condition: service_started
+    environment:
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DATABASE: ${PG_DATABASE}
+      TLS_PORT: "443"
+      BACKEND_HOST: magnusbilling-honeypot
+      BACKEND_PORT: "80"
+      CERT_DIR: /certs
+      TLS_CERT_CN: ${TLS_CERT_CN:-magnusbilling}
+      APACHE_VERSION_BANNER: ${APACHE_VERSION_BANNER:-Apache/2.4.41 (Ubuntu)}
+    ports:
+      - "${BIND_IP:-0.0.0.0}:443:443"
+    volumes:
+      - tls_cert:/certs
     networks:
       - honeypot_net
     read_only: true

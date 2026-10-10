@@ -10,6 +10,7 @@ honeypot, all logging into one Postgres `events` table.
 | `sip-honeypot` | 5060/udp, bound to `BIND_IP` (default all interfaces) |
 | `ami-honeypot` | 5038/tcp, bound to `BIND_IP` (default all interfaces) |
 | `magnusbilling-honeypot` | 80/tcp, bound to `BIND_IP` (default all interfaces) |
+| `magnusbilling-tls` | 443/tcp, bound to `BIND_IP` — HTTPS front for the web decoy (self-signed cert, JA4 fingerprinting), proxies to `magnusbilling-honeypot` |
 | `stun-server` | 3478/udp, bound to `BIND_IP` (default all interfaces) — self-hosted STUN for `magnusbilling-honeypot`'s WebRTC VPN-leak check |
 | `cowrie` (SSH) | 22/tcp, bound to `BIND_IP` (default all interfaces) |
 | `ssh-log-shipper` | — (no listener, ships Cowrie's log into Postgres) |
@@ -84,9 +85,24 @@ docker compose up -d --build
   request's method/version/header shape, so it identifies the client
   *software* regardless of the User-Agent it claims — curl spoofing a Chrome
   UA still fingerprints as curl. Cluster scanners with e.g.
-  `json_extract_scalar(extra, '$.ja4h')` in Trino. Only JA4H applies here
-  since the decoy is plain HTTP: JA4 (TLS) would need a 443 listener with
-  ClientHello access, JA4T (TCP) a packet-capture sidecar.
+  `json_extract_scalar(extra, '$.ja4h')` in Trino. (JA4T, the TCP
+  fingerprint, isn't captured — it'd need a packet-capture sidecar.)
+- `magnusbilling-tls` serves the same decoy over HTTPS on 443 with a
+  self-signed snakeoil-style cert (CN from `TLS_CERT_CN`, persisted in the
+  `tls_cert` volume so its fingerprint stays stable across restarts, like a
+  real box). No domain or Let's Encrypt involved — that's how most real VoIP
+  installs look anyway, and scanners don't validate certs. Before the
+  handshake it peeks each raw ClientHello and computes its **JA4** TLS
+  fingerprint ([common/ja4.py](common/ja4.py)); every connection gets a
+  `tls_handshake` event with `extra.ja4`/`ja4_r`, SNI/ALPN and whether the
+  handshake succeeded — so handshake-only scanners and clients that reject
+  the cert are fingerprinted too. HTTP requests are then proxied to
+  `magnusbilling-honeypot`, whose events carry `extra.scheme = 'https'`,
+  `dst_port = 443`, and the JA4 alongside JA4H. The real client IP/port and
+  JA4 travel in one `X-Honeypot-Conn` header that the decoy trusts only from
+  a docker-network peer (and the front strips any copy a client sends), so
+  it can't be spoofed from outside. Speaking plain HTTP to 443 gets Apache's
+  genuine "You're speaking plain HTTP to an SSL-enabled server port" 400.
 - `bootstrap.js` also gathers WebRTC ICE candidates against our own
   `stun-server` (not a third-party STUN host — nothing external sees this
   happen) to check for a real public IP that leaks outside a visitor's VPN/

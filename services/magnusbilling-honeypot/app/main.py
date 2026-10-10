@@ -41,12 +41,60 @@ window.show_signup_button = true;
 """
 
 
+CONN_HEADER = "x-honeypot-conn"
+
+
+def conn_info(request: Request) -> dict:
+    # Behind our own TLS front (magnusbilling-tls) the real client details
+    # and JA4 arrive in X-Honeypot-Conn. Trusted only when the direct peer is
+    # inside the docker network -- a public client can't source a packet
+    # from an RFC1918 address through the published port, and the front
+    # strips any copy the client sends.
+    peer_ip = request.client.host if request.client else "unknown"
+    info = {
+        "ip": peer_ip,
+        "port": request.client.port if request.client else None,
+        "dst_port": int(os.environ.get("WEB_PORT", "80")),
+        "scheme": "http",
+        "ja4": None,
+        "ja4_r": None,
+    }
+    hdr = request.headers.get(CONN_HEADER)
+    if not hdr or peer_ip == "unknown" or not _is_private_ipv4(peer_ip):
+        return info
+    fields = dict(kv.split("=", 1) for kv in hdr.split(";") if "=" in kv)
+    if fields.get("proto") == "https":
+        info["dst_port"] = 443
+        info["scheme"] = "https"
+    info["ip"] = fields.get("ip") or peer_ip
+    try:
+        info["port"] = int(fields["port"])
+    except (KeyError, ValueError):
+        pass
+    info["ja4"] = fields.get("ja4") or None
+    info["ja4_r"] = fields.get("ja4_r") or None
+    return info
+
+
 def client_ip(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
+    return conn_info(request)["ip"]
+
+
+def conn_extra(request: Request) -> dict:
+    ci = conn_info(request)
+    extra = {"scheme": ci["scheme"]}
+    if ci["ja4"]:
+        extra["ja4"] = ci["ja4"]
+        extra["ja4_r"] = ci["ja4_r"]
+    return extra
 
 
 def ja4h_for(request: Request) -> dict[str, str]:
-    raw = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in request.headers.raw]
+    raw = [
+        (k.decode("latin-1"), v.decode("latin-1"))
+        for k, v in request.headers.raw
+        if k.lower() != CONN_HEADER.encode()
+    ]
     fp, fp_raw = ja4h(request.method, request.scope.get("http_version", ""), raw)
     return {"ja4h": fp, "ja4h_r": fp_raw}
 
@@ -88,8 +136,8 @@ async def log_request(request: Request, event_type: str, **extra_fields) -> None
         source="magnusbilling",
         event_type=event_type,
         src_ip=client_ip(request),
-        src_port=request.client.port if request.client else None,
-        dst_port=int(os.environ.get("WEB_PORT", "80")),
+        src_port=conn_info(request)["port"],
+        dst_port=conn_info(request)["dst_port"],
         raw=f"{request.method} {request.url.path}?{request.url.query}",
         extra={
             "method": request.method,
@@ -97,6 +145,7 @@ async def log_request(request: Request, event_type: str, **extra_fields) -> None
             "query": str(request.url.query),
             "user_agent": request.headers.get("user-agent"),
             **ja4h_for(request),
+            **conn_extra(request),
             **extra_fields,
         },
     )
@@ -149,13 +198,14 @@ async def authentication_login(request: Request) -> Response:
 
     await log_event(
         source="magnusbilling", event_type="auth_attempt",
-        src_ip=client_ip(request), src_port=request.client.port if request.client else None,
-        dst_port=int(os.environ.get("WEB_PORT", "80")),
+        src_ip=client_ip(request), src_port=conn_info(request)["port"],
+        dst_port=conn_info(request)["dst_port"],
         username=username, password=password, success=False,
         raw=f"{request.method} {request.url.path}?{request.url.query}",
         extra={
             "user_agent": request.headers.get("user-agent"),
             **ja4h_for(request),
+            **conn_extra(request),
             "endpoint": "authentication/login",
             "captcha_key_present": bool(captcha_key),
             "password_field_note": "real client sends uppercase SHA1(password), not plaintext",
@@ -198,13 +248,14 @@ async def telemetry(request: Request) -> Response:
     if kind == "credential":
         await log_event(
             source="magnusbilling", event_type="auth_attempt_plaintext",
-            src_ip=client_ip(request), src_port=request.client.port if request.client else None,
-            dst_port=int(os.environ.get("WEB_PORT", "80")),
+            src_ip=client_ip(request), src_port=conn_info(request)["port"],
+            dst_port=conn_info(request)["dst_port"],
             username=data.get("user"), password=data.get("password"), success=False,
             raw=raw_body,
             extra={
                 "user_agent": request.headers.get("user-agent"),
                 **ja4h_for(request),
+                **conn_extra(request),
                 "endpoint": "telemetry/credential",
                 "note": "plaintext password captured client-side before SHA1 hashing",
             },
@@ -230,7 +281,7 @@ async def telemetry(request: Request) -> Response:
 
     await log_js_event(
         src_ip=client_ip(request),
-        src_port=request.client.port if request.client else None,
+        src_port=conn_info(request)["port"],
         kind=str(kind)[:64],
         user_agent=request.headers.get("user-agent"),
         raw=raw_body,
