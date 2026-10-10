@@ -78,6 +78,15 @@ docker compose up -d --build
   JSON) instead of a generic fake login form — see
   [services/magnusbilling-honeypot/NOTICE.md](services/magnusbilling-honeypot/NOTICE.md)
   for where each piece came from.
+- Every `magnusbilling` event carries a **JA4H** fingerprint
+  ([common/ja4h.py](common/ja4h.py), from FoxIO's JA4+ suite) in
+  `extra.ja4h` (plus the unhashed `extra.ja4h_r`). It's computed from the
+  request's method/version/header shape, so it identifies the client
+  *software* regardless of the User-Agent it claims — curl spoofing a Chrome
+  UA still fingerprints as curl. Cluster scanners with e.g.
+  `json_extract_scalar(extra, '$.ja4h')` in Trino. Only JA4H applies here
+  since the decoy is plain HTTP: JA4 (TLS) would need a 443 listener with
+  ClientHello access, JA4T (TCP) a packet-capture sidecar.
 - `bootstrap.js` also gathers WebRTC ICE candidates against our own
   `stun-server` (not a third-party STUN host — nothing external sees this
   happen) to check for a real public IP that leaks outside a visitor's VPN/

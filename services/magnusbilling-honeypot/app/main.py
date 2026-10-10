@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, "/app/common")
 
 from db import log_event, log_js_event  # noqa: E402
+from ja4h import ja4h  # noqa: E402
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -42,6 +43,12 @@ window.show_signup_button = true;
 
 def client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
+
+
+def ja4h_for(request: Request) -> dict[str, str]:
+    raw = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in request.headers.raw]
+    fp, fp_raw = ja4h(request.method, request.scope.get("http_version", ""), raw)
+    return {"ja4h": fp, "ja4h_r": fp_raw}
 
 
 _CANDIDATE_RE = re.compile(r"candidate:\S+ \d+ \S+ \d+ (\S+) \d+ typ (\S+)")
@@ -89,6 +96,7 @@ async def log_request(request: Request, event_type: str, **extra_fields) -> None
             "path": request.url.path,
             "query": str(request.url.query),
             "user_agent": request.headers.get("user-agent"),
+            **ja4h_for(request),
             **extra_fields,
         },
     )
@@ -147,6 +155,7 @@ async def authentication_login(request: Request) -> Response:
         raw=f"{request.method} {request.url.path}?{request.url.query}",
         extra={
             "user_agent": request.headers.get("user-agent"),
+            **ja4h_for(request),
             "endpoint": "authentication/login",
             "captcha_key_present": bool(captcha_key),
             "password_field_note": "real client sends uppercase SHA1(password), not plaintext",
@@ -195,6 +204,7 @@ async def telemetry(request: Request) -> Response:
             raw=raw_body,
             extra={
                 "user_agent": request.headers.get("user-agent"),
+                **ja4h_for(request),
                 "endpoint": "telemetry/credential",
                 "note": "plaintext password captured client-side before SHA1 hashing",
             },
